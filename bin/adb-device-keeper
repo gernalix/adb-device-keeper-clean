@@ -1,0 +1,470 @@
+#!/usr/bin/bash
+
+set -uo pipefail
+
+readonly ADB=${ADB_DEVICE_KEEPER_ADB:-$HOME/Android/Sdk/platform-tools/adb}
+readonly TAILSCALE=${ADB_DEVICE_KEEPER_TAILSCALE:-/usr/bin/tailscale}
+readonly CONFIG=${ADB_DEVICE_KEEPER_CONFIG:-$HOME/.config/codex/secrets/adb-device-keeper/config}
+readonly STATE_DIR=${ADB_DEVICE_KEEPER_STATE_DIR:-$HOME/.local/state/adb-device-keeper}
+readonly LOCK_FILE="$STATE_DIR/keeper.lock"
+readonly ABSENT_INTERVAL=25
+readonly HEALTHY_INTERVAL=60
+readonly MAX_RETRY_DELAY=300
+
+declare -a DEVICE_NAME MANUFACTURER MODEL PRODUCT_DEVICE HARDWARE_SERIAL MDNS_PREFIX
+declare -a DISCOVERED_ENDPOINT CONNECTED_TRANSPORT
+DEVICE_COUNT=0
+LAST_MISSING=0
+STOP_REQUESTED=0
+
+log_info() {
+    printf 'INFO: %s\n' "$*"
+}
+
+log_error_once() {
+    local key=$1 message=$2 file old=''
+    file="$STATE_DIR/error.$key"
+    [[ -f $file ]] && IFS= read -r old < "$file"
+    if [[ $old != "$message" ]]; then
+        printf '%s\n' "$message" > "$file"
+        printf 'ERROR: %s\n' "$message"
+    fi
+}
+
+clear_error() {
+    rm -f "$STATE_DIR/error.$1"
+}
+
+die() {
+    printf 'ERROR: %s\n' "$*" >&2
+    exit 2
+}
+
+adb_with_timeout() {
+    local seconds=$1
+    shift
+    timeout --foreground "${seconds}s" "$ADB" "$@"
+}
+
+load_config() {
+    local name manufacturer model product_device hardware_serial mdns_prefix extra line_number=0
+
+    [[ -x $ADB ]] || die "ADB non eseguibile: $ADB"
+    [[ -r $CONFIG ]] || die "configurazione non leggibile: $CONFIG"
+
+    while IFS='|' read -r name manufacturer model product_device hardware_serial mdns_prefix extra; do
+        ((line_number += 1))
+        [[ -z $name || $name == \#* ]] && continue
+        [[ -z ${extra:-} ]] || die "campo inatteso nella configurazione, riga $line_number"
+        [[ $name =~ ^[A-Za-z0-9_]+$ ]] || die "nome dispositivo non valido, riga $line_number"
+        [[ -n $manufacturer && -n $model && -n $product_device && -n $hardware_serial ]] || \
+            die "identità incompleta, riga $line_number"
+        [[ $mdns_prefix == "adb-${hardware_serial}-" ]] || \
+            die "prefisso mDNS incoerente, riga $line_number"
+
+        DEVICE_NAME+=("$name")
+        MANUFACTURER+=("$manufacturer")
+        MODEL+=("$model")
+        PRODUCT_DEVICE+=("$product_device")
+        HARDWARE_SERIAL+=("$hardware_serial")
+        MDNS_PREFIX+=("$mdns_prefix")
+        DISCOVERED_ENDPOINT+=("")
+        CONNECTED_TRANSPORT+=("")
+        ((DEVICE_COUNT += 1))
+    done < "$CONFIG"
+
+    ((DEVICE_COUNT == 2)) || die "sono richiesti esattamente due dispositivi autorizzati"
+}
+
+state_file() {
+    printf '%s/%s.%s' "$STATE_DIR" "${DEVICE_NAME[$1]}" "$2"
+}
+
+read_state() {
+    local file
+    file=$(state_file "$1" "$2")
+    [[ -f $file ]] && IFS= read -r REPLY < "$file" || REPLY=''
+}
+
+write_state() {
+    local file
+    file=$(state_file "$1" "$2")
+    printf '%s\n' "$3" > "$file"
+    chmod 600 "$file"
+}
+
+is_local_endpoint() {
+    local endpoint=$1 host port first second
+    [[ $endpoint != *[[:space:]]* && $endpoint == *:* ]] || return 1
+    host=${endpoint%:*}
+    port=${endpoint##*:}
+    [[ $port =~ ^[0-9]+$ ]] || return 1
+    ((10#$port >= 1 && 10#$port <= 65535)) || return 1
+
+    if [[ $host =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]]; then
+        first=${BASH_REMATCH[1]}
+        second=${BASH_REMATCH[2]}
+        ((first == 10)) && return 0
+        ((first == 172 && second >= 16 && second <= 31)) && return 0
+        ((first == 192 && second == 168)) && return 0
+        ((first == 169 && second == 254)) && return 0
+        return 1
+    fi
+
+    [[ $host == *.local ]] && return 0
+    [[ $host =~ ^\[(fe80|fc|fd)[0-9A-Fa-f:%.]+\]$ ]]
+}
+
+is_tailscale_endpoint() {
+    local endpoint=$1 host port first second
+    [[ $endpoint != *[[:space:]]* && $endpoint == *:* ]] || return 1
+    host=${endpoint%:*}
+    port=${endpoint##*:}
+    [[ $port =~ ^[0-9]+$ ]] || return 1
+    ((10#$port >= 1 && 10#$port <= 65535)) || return 1
+
+    if [[ $host =~ ^100\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]]; then
+        first=${BASH_REMATCH[1]}
+        second=${BASH_REMATCH[2]}
+        ((first >= 64 && first <= 127 && second >= 0 && second <= 255)) && return 0
+    fi
+
+    [[ $host == *.ts.net || $host =~ ^\[(fd7a|fd7b)[0-9A-Fa-f:%.]+\]$ ]]
+}
+
+is_adb_endpoint() {
+    is_local_endpoint "$1" || is_tailscale_endpoint "$1"
+}
+
+device_tailscale_name() {
+    printf '%s\n' "${DEVICE_NAME[$1]}" | tr '[:upper:]_' '[:lower:]-'
+}
+
+tailscale_ip_for_device() {
+    local index=$1 wanted ip name rest
+    [[ -x $TAILSCALE ]] || return 1
+    wanted=$(device_tailscale_name "$index")
+    while read -r ip name rest; do
+        [[ $name == "$wanted" ]] || continue
+        [[ $ip =~ ^100\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] || continue
+        printf '%s\n' "$ip"
+        return 0
+    done < <("$TAILSCALE" status 2>/dev/null)
+    return 1
+}
+
+tailscale_endpoint_for() {
+    local index=$1 source_endpoint=$2 port ip
+    [[ $source_endpoint == *:* ]] || return 1
+    port=${source_endpoint##*:}
+    [[ $port =~ ^[0-9]+$ ]] || return 1
+    ip=$(tailscale_ip_for_device "$index") || return 1
+    printf '%s:%s\n' "$ip" "$port"
+}
+
+transport_is_candidate() {
+    local index=$1 transport=$2 cached previous tailscale_ip host
+    [[ $transport == "${HARDWARE_SERIAL[$index]}" ]] && return 0
+    [[ $transport == "${MDNS_PREFIX[$index]}"* ]] && return 0
+    if is_tailscale_endpoint "$transport"; then
+        host=${transport%:*}
+        tailscale_ip=$(tailscale_ip_for_device "$index" || true)
+        [[ -n $tailscale_ip && $host == "$tailscale_ip" ]] && return 0
+    fi
+    read_state "$index" endpoint
+    cached=$REPLY
+    [[ -n $cached && $transport == "$cached" ]] && return 0
+    read_state "$index" transport
+    previous=$REPLY
+    [[ -n $previous && $transport == "$previous" ]]
+}
+
+get_prop() {
+    local transport=$1 property=$2 value
+    value=$(adb_with_timeout 4 -s "$transport" shell getprop "$property" 2>/dev/null) || return 1
+    value=${value//$'\r'/}
+    value=${value//$'\n'/}
+    printf '%s' "$value"
+}
+
+verify_transport() {
+    local index=$1 transport=$2 manufacturer model product_device hardware_serial
+    manufacturer=$(get_prop "$transport" ro.product.manufacturer) || return 1
+    model=$(get_prop "$transport" ro.product.model) || return 1
+    product_device=$(get_prop "$transport" ro.product.device) || return 1
+    hardware_serial=$(get_prop "$transport" ro.serialno) || return 1
+
+    [[ $manufacturer == "${MANUFACTURER[$index]}" &&
+       $model == "${MODEL[$index]}" &&
+       $product_device == "${PRODUCT_DEVICE[$index]}" &&
+       $hardware_serial == "${HARDWARE_SERIAL[$index]}" ]]
+}
+
+disconnect_candidate() {
+    local transport=$1 endpoint=${2:-}
+    adb_with_timeout 6 disconnect "$transport" >/dev/null 2>&1 || true
+    if [[ -n $endpoint && $endpoint != "$transport" ]]; then
+        adb_with_timeout 6 disconnect "$endpoint" >/dev/null 2>&1 || true
+    fi
+}
+
+find_connected_transport() {
+    local index=$1 devices_output=$2 transport state rest
+    while read -r transport state rest; do
+        [[ ${state:-} == device ]] || continue
+        transport_is_candidate "$index" "$transport" || continue
+        if verify_transport "$index" "$transport"; then
+            CONNECTED_TRANSPORT[$index]=$transport
+            clear_error "identity.${DEVICE_NAME[$index]}"
+            return 0
+        fi
+        disconnect_candidate "$transport" "${DISCOVERED_ENDPOINT[$index]}"
+        log_error_once "identity.${DEVICE_NAME[$index]}" \
+            "identità non autorizzata sull'endpoint candidato di ${DEVICE_NAME[$index]}; disconnesso"
+    done <<< "$devices_output"
+    return 1
+}
+
+discover_endpoints() {
+    local mdns_output instance service endpoint rest index
+    if ! mdns_output=$(adb_with_timeout 10 mdns services 2>&1); then
+        log_error_once mdns "discovery mDNS ADB non disponibile; nuovo tentativo con backoff"
+        return 0
+    fi
+    clear_error mdns
+
+    while read -r instance service endpoint rest; do
+        [[ $service == _adb-tls-connect._tcp ]] || continue
+        is_local_endpoint "$endpoint" || continue
+        for ((index = 0; index < DEVICE_COUNT; index++)); do
+            if [[ $instance == "${MDNS_PREFIX[$index]}"* ]]; then
+                DISCOVERED_ENDPOINT[$index]=$endpoint
+                break
+            fi
+        done
+    done <<< "$mdns_output"
+}
+
+retry_allowed() {
+    local index=$1 endpoint=$2 old_endpoint after now
+    read_state "$index" retry_endpoint
+    old_endpoint=$REPLY
+    read_state "$index" retry_after
+    after=${REPLY:-0}
+    now=$(date +%s)
+    [[ $old_endpoint != "$endpoint" || ! $after =~ ^[0-9]+$ || $now -ge $after ]]
+}
+
+record_connect_failure() {
+    local index=$1 endpoint=$2 delay after
+    read_state "$index" retry_delay
+    delay=${REPLY:-$ABSENT_INTERVAL}
+    [[ $delay =~ ^[0-9]+$ ]] || delay=$ABSENT_INTERVAL
+    ((delay < ABSENT_INTERVAL)) && delay=$ABSENT_INTERVAL
+    ((delay > MAX_RETRY_DELAY)) && delay=$MAX_RETRY_DELAY
+    after=$(($(date +%s) + delay))
+    write_state "$index" retry_endpoint "$endpoint"
+    write_state "$index" retry_after "$after"
+    ((delay *= 2))
+    ((delay > MAX_RETRY_DELAY)) && delay=$MAX_RETRY_DELAY
+    write_state "$index" retry_delay "$delay"
+}
+
+clear_retry() {
+    rm -f "$(state_file "$1" retry_endpoint)" "$(state_file "$1" retry_after)" \
+        "$(state_file "$1" retry_delay)"
+}
+
+connect_and_verify() {
+    local index=$1 endpoint=$2 output transport state rest devices_output
+    retry_allowed "$index" "$endpoint" || return 1
+
+    if ! output=$(adb_with_timeout 8 connect "$endpoint" 2>&1); then
+        record_connect_failure "$index" "$endpoint"
+        log_error_once "connect.${DEVICE_NAME[$index]}" \
+            "connessione non riuscita per ${DEVICE_NAME[$index]}; ritento con backoff"
+        return 1
+    fi
+
+    devices_output=$(adb_with_timeout 8 devices 2>/dev/null) || devices_output=''
+    if verify_transport "$index" "$endpoint"; then
+        CONNECTED_TRANSPORT[$index]=$endpoint
+    else
+        while read -r transport state rest; do
+            [[ ${state:-} == device ]] || continue
+            transport_is_candidate "$index" "$transport" || continue
+            if verify_transport "$index" "$transport"; then
+                CONNECTED_TRANSPORT[$index]=$transport
+                break
+            fi
+        done <<< "$devices_output"
+    fi
+
+    if [[ -z ${CONNECTED_TRANSPORT[$index]} ]]; then
+        disconnect_candidate "$endpoint"
+        record_connect_failure "$index" "$endpoint"
+        log_error_once "identity.${DEVICE_NAME[$index]}" \
+            "endpoint mDNS candidato non corrisponde a ${DEVICE_NAME[$index]}; disconnesso"
+        return 1
+    fi
+
+    clear_retry "$index"
+    clear_error "connect.${DEVICE_NAME[$index]}"
+    clear_error "identity.${DEVICE_NAME[$index]}"
+    return 0
+}
+
+commit_endpoint() {
+    local index=$1 endpoint=$2 old
+    [[ -n $endpoint ]] || return 0
+    read_state "$index" endpoint
+    old=$REPLY
+    if [[ -n $old && $old != "$endpoint" ]]; then
+        log_info "endpoint cambiato: ${DEVICE_NAME[$index]} $old -> $endpoint"
+    fi
+    write_state "$index" endpoint "$endpoint"
+}
+
+commit_status() {
+    local index=$1 connected=$2 transport=${3:-} old
+    read_state "$index" status
+    old=$REPLY
+    if ((connected)); then
+        if [[ $old != connected ]]; then
+            log_info "dispositivo connesso: ${DEVICE_NAME[$index]} transport=$transport"
+        fi
+        write_state "$index" status connected
+        write_state "$index" transport "$transport"
+    else
+        if [[ $old == connected ]]; then
+            log_info "dispositivo perso: ${DEVICE_NAME[$index]}"
+        fi
+        write_state "$index" status absent
+    fi
+}
+
+run_cycle() {
+    local devices_output index endpoint cached connected missing=0 fallback_endpoint commit_candidate
+    for ((index = 0; index < DEVICE_COUNT; index++)); do
+        DISCOVERED_ENDPOINT[$index]=''
+        CONNECTED_TRANSPORT[$index]=''
+    done
+
+    if ! adb_with_timeout 12 start-server >/dev/null 2>&1; then
+        log_error_once server "server ADB non avviabile"
+        return 1
+    fi
+    clear_error server
+
+    if ! devices_output=$(adb_with_timeout 8 devices 2>/dev/null); then
+        log_error_once devices "elenco dispositivi ADB non disponibile"
+        return 1
+    fi
+    clear_error devices
+
+    discover_endpoints
+
+    for ((index = 0; index < DEVICE_COUNT; index++)); do
+        connected=0
+        if find_connected_transport "$index" "$devices_output"; then
+            connected=1
+        else
+            commit_status "$index" 0
+            endpoint=${DISCOVERED_ENDPOINT[$index]}
+            if [[ -z $endpoint ]]; then
+                read_state "$index" endpoint
+                cached=$REPLY
+                is_adb_endpoint "$cached" && endpoint=$cached || endpoint=''
+            fi
+            if [[ -n $endpoint ]]; then
+                if connect_and_verify "$index" "$endpoint"; then
+                    connected=1
+                    devices_output=$(adb_with_timeout 8 devices 2>/dev/null) || true
+                elif is_local_endpoint "$endpoint" && fallback_endpoint=$(tailscale_endpoint_for "$index" "$endpoint"); then
+                    log_info "fallback Tailscale per ${DEVICE_NAME[$index]}: $fallback_endpoint"
+                    if connect_and_verify "$index" "$fallback_endpoint"; then
+                        connected=1
+                        devices_output=$(adb_with_timeout 8 devices 2>/dev/null) || true
+                    fi
+                fi
+            fi
+        fi
+
+        if ((connected)); then
+            commit_candidate=${DISCOVERED_ENDPOINT[$index]}
+            [[ -n $commit_candidate ]] || commit_candidate=${CONNECTED_TRANSPORT[$index]}
+            is_adb_endpoint "$commit_candidate" && commit_endpoint "$index" "$commit_candidate"
+            commit_status "$index" 1 "${CONNECTED_TRANSPORT[$index]}"
+        else
+            commit_status "$index" 0
+            ((missing += 1))
+        fi
+    done
+
+    LAST_MISSING=$missing
+    return 0
+}
+
+run_locked_cycle() {
+    local lock_fd rc
+    exec {lock_fd}> "$LOCK_FILE"
+    if ! flock -w 12 "$lock_fd"; then
+        log_error_once lock "ciclo già in corso oltre il timeout di lock"
+        exec {lock_fd}>&-
+        return 1
+    fi
+    clear_error lock
+    run_cycle
+    rc=$?
+    flock -u "$lock_fd"
+    exec {lock_fd}>&-
+    return "$rc"
+}
+
+request_stop() {
+    STOP_REQUESTED=1
+}
+
+run_daemon() {
+    local interval=$ABSENT_INTERVAL failures=0
+    trap request_stop TERM INT
+    log_info "adb-device-keeper avviato"
+
+    while ((STOP_REQUESTED == 0)); do
+        if run_locked_cycle; then
+            failures=0
+            if ((LAST_MISSING == 0)); then
+                interval=$HEALTHY_INTERVAL
+            else
+                interval=$ABSENT_INTERVAL
+            fi
+        else
+            ((failures += 1))
+            interval=$((ABSENT_INTERVAL << (failures > 2 ? 2 : failures)))
+            ((interval > MAX_RETRY_DELAY)) && interval=$MAX_RETRY_DELAY
+        fi
+        if ((STOP_REQUESTED == 0)); then
+            sleep "$interval" &
+            wait $! || true
+        fi
+    done
+
+    log_info "adb-device-keeper arrestato"
+}
+
+main() {
+    umask 077
+    mkdir -p "$STATE_DIR"
+    chmod 700 "$STATE_DIR"
+    load_config
+
+    case ${1:---once} in
+        --daemon) run_daemon ;;
+        --once) run_locked_cycle ;;
+        *) die "uso: adb-device-keeper [--daemon|--once]" ;;
+    esac
+}
+
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
+    main "$@"
+fi

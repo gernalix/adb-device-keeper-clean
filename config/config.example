@@ -1,0 +1,3 @@
+# name|manufacturer|model|product_device|hardware_serial|mdns_instance_prefix
+Example_A|ExampleVendor|Example Model A|example_a|REPLACE_WITH_SERIAL|adb-REPLACE_WITH_SERIAL-
+Example_B|ExampleVendor|Example Model B|example_b|REPLACE_WITH_SERIAL|adb-REPLACE_WITH_SERIAL-
