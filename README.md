@@ -28,6 +28,68 @@ Tailscale peer and re-verifying the device identity. It does not install an
 Android app, persist an unlock secret, change VPN settings, or make the listener
 survive another reboot.
 
+## Non-invasive operating runbook
+
+Use the shell path first. It can inspect system state without changing the app
+currently in the foreground. Every physical-device session must begin with the
+MegaVault identity gate and the keeper's non-destructive runtime check:
+
+```bash
+ADB="$HOME/Android/Sdk/platform-tools/adb"
+SERIAL='TAILSCALE_IP:5555'
+python3 /home/daniele/MegaVault/tools/adb_device_gate.py \
+  --target pixel --serial "$SERIAL"
+bash scripts/runtime-check.sh
+```
+
+After both checks pass, passive commands such as `getprop`, `dumpsys power`,
+`dumpsys display`, `dumpsys deviceidle`, and `dumpsys connectivity` are allowed
+while the user is using another app. They must not launch an activity, send an
+input event, wake or lock the display, or capture screen contents. Re-run the
+identity gate before a later, separate device operation; do not treat an IP
+address or a remembered ADB serial as identity.
+
+The following require explicit user consent for the specific operation because
+they can expose screen contents, take focus, or change connectivity: `scrcpy`,
+screenshots or screen recording, UI Automator inspection/action, `adb shell
+input`, `am start`, display wake/lock, changing Wi-Fi or Tailscale, and reboot.
+Check display and keyguard state immediately before any approved UI operation.
+Never automate or retain a PIN, password, fingerprint, or unlock pattern.
+
+### Operating envelope and recovery
+
+| State | Safe capability | Boundary or recovery |
+| --- | --- | --- |
+| Home Wi-Fi with Tailscale connected | Passive ADB shell and keeper checks | UI interaction still requires consent and an unlocked display. |
+| Mobile data with Wi-Fi disabled | Passive ADB shell can work through the verified Tailscale endpoint while `adbd` still listens on TCP | Confirm Wi-Fi is really off and the VPN transport is cellular; no result from Wi-Fi proves this case. |
+| Screen on with another app in front | Passive shell only | Do not open a window, inject input, inspect the UI tree, or capture the screen. |
+| Screen off or Doze | Shell may remain available while Tailscale and `adbd` remain alive | Expect battery/network delay. Do not wake the display without consent. |
+| Keyguard/PIN showing | Passive shell may remain available | Stop before GUI interaction; the user must unlock physically. |
+| Tailscale interrupted | The Fedora keeper retries known, identity-verified endpoints | If the Android VPN is down, ADB cannot restore it. Ask the user to reconnect Tailscale; do not change VPN settings implicitly. |
+| After Android reboot | No autonomous TCP recovery is promised | After boot, first physical unlock, and Tailscale reconnect, attach USB and run `adb-device-keeper --recover-usb DEVICE_NAME`. |
+| Fedora suspended, powered off, or offline | None: the user service and remote-command bridge are unavailable | Resume or power on Fedora first. There is no phone-side replacement daemon. |
+
+[ADB shell](https://developer.android.com/tools/adb) is the existing control
+plane. [AndroidX UI Automator](https://developer.android.com/training/testing/other-components/ui-automator)
+remains suitable for an explicitly authorized UI test, but it is not a passive
+remote-control channel. [`scrcpy`](https://github.com/Genymobile/scrcpy) is a
+maintained upstream option for a visible, consented session, not a background
+automation mechanism; it was not installed as part of this workflow. Remote
+Desktop Commander reaches the Fedora host, so it inherits the same host-awake
+and ADB/[Tailscale](https://tailscale.com/docs/install/android) limits rather
+than bypassing them.
+
+### Live acceptance snapshot (2026-10-17)
+
+The allowlisted Pixel 8a identity gate passed over the Tailscale ADB endpoint.
+On the observed home-Wi-Fi state, Android reported boot complete, TCP port 5555,
+Tailscale validated, screen on, and keyguard not showing. Five passive `adb shell
+true` samples completed in 47--68 ms. The Fedora user service was active with no
+restart and `scripts/runtime-check.sh` passed. The same observation did **not**
+prove Wi-Fi-off mobile data, screen-off/Doze, a real Tailscale interruption, or
+post-reboot recovery; those cases require a changed physical state or explicit
+consent and must remain reported as untested until then.
+
 ## Runtime paths
 
 - Script: `$HOME/.local/bin/adb-device-keeper`
