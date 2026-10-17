@@ -248,10 +248,15 @@ discover_endpoints() {
 # Prefer the previously verified Tailscale TCP endpoint over stale Wi-Fi mDNS.
 # Only reuse a Tailscale IP that still belongs to this allowlisted Android peer.
 select_endpoint() {
-    local index=$1 discovered cached peer_ip
+    local index=$1 discovered cached preferred peer_ip
     discovered=${DISCOVERED_ENDPOINT[$index]}
     read_state "$index" endpoint
     cached=$REPLY
+
+    if preferred=$(preferred_tailscale_endpoint "$index"); then
+        printf '%s\n' "$preferred"
+        return 0
+    fi
 
     if is_tailscale_endpoint "$cached"; then
         peer_ip=$(tailscale_ip_for_device "$index" 2>/dev/null || true)
@@ -270,6 +275,22 @@ select_endpoint() {
         return 0
     fi
     return 1
+}
+
+preferred_tailscale_endpoint() {
+    local index=$1 endpoint peer_ip
+    read_state "$index" tailscale_endpoint
+    endpoint=$REPLY
+    is_tailscale_endpoint "$endpoint" || return 1
+    peer_ip=$(tailscale_ip_for_device "$index" 2>/dev/null || true)
+    [[ -n $peer_ip && ${endpoint%:*} == "$peer_ip" ]] || return 1
+    printf '%s\n' "$endpoint"
+}
+
+remember_tailscale_endpoint() {
+    local index=$1 endpoint=$2
+    is_tailscale_endpoint "$endpoint" || return 0
+    write_state "$index" tailscale_endpoint "$endpoint"
 }
 
 select_commit_endpoint() {
@@ -329,7 +350,7 @@ connect_and_verify() {
     devices_output=$(adb_with_timeout 8 devices 2>/dev/null) || devices_output=''
     if verify_transport "$index" "$endpoint"; then
         CONNECTED_TRANSPORT[$index]=$endpoint
-    else
+    elif ! is_tailscale_endpoint "$endpoint"; then
         while read -r transport state rest; do
             [[ ${state:-} == device ]] || continue
             transport_is_candidate "$index" "$transport" || continue
@@ -359,10 +380,12 @@ commit_endpoint() {
     [[ -n $endpoint ]] || return 0
     read_state "$index" endpoint
     old=$REPLY
+    remember_tailscale_endpoint "$index" "$old"
     if [[ -n $old && $old != "$endpoint" ]]; then
         log_info "endpoint cambiato: ${DEVICE_NAME[$index]} $old -> $endpoint"
     fi
     write_state "$index" endpoint "$endpoint"
+    remember_tailscale_endpoint "$index" "$endpoint"
 }
 
 commit_status() {
@@ -384,7 +407,7 @@ commit_status() {
 }
 
 run_cycle() {
-    local devices_output index endpoint connected missing=0 fallback_endpoint commit_candidate
+    local devices_output index endpoint connected missing=0 fallback_endpoint commit_candidate preferred_endpoint
     for ((index = 0; index < DEVICE_COUNT; index++)); do
         DISCOVERED_ENDPOINT[$index]=''
         CONNECTED_TRANSPORT[$index]=''
@@ -408,6 +431,12 @@ run_cycle() {
         connected=0
         if find_connected_transport "$index" "$devices_output"; then
             connected=1
+            if ! is_tailscale_endpoint "${CONNECTED_TRANSPORT[$index]}" &&
+               preferred_endpoint=$(preferred_tailscale_endpoint "$index"); then
+                if connect_and_verify "$index" "$preferred_endpoint"; then
+                    devices_output=$(adb_with_timeout 8 devices 2>/dev/null) || true
+                fi
+            fi
         else
             commit_status "$index" 0
             endpoint=$(select_endpoint "$index") || endpoint=''
