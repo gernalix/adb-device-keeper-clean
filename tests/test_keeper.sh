@@ -18,6 +18,7 @@ grep -Fq 'Restart=always' "$UNIT"
 grep -Fq 'RestartSec=30' "$UNIT"
 grep -Fq 'systemctl --user restart adb-device-keeper.service' "$DEPLOY"
 ! grep -Fq 'enable --now' "$DEPLOY"
+grep -Fq 'rev-parse --is-inside-work-tree' "$DEPLOY"
 grep -Fq 'bash "$RUNTIME_CHECK" "$@"' "$DEPLOY"
 [[ $(bash "$RUNTIME_CHECK" --classify-transport '100.64.0.1:37123') == tailscale ]]
 [[ $(bash "$RUNTIME_CHECK" --classify-transport '100.127.255.254:65535') == tailscale ]]

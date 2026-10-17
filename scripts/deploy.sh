@@ -9,7 +9,10 @@ UNIT_DST="$HOME/.config/systemd/user/adb-device-keeper.service"
 CONFIG_DST="$HOME/.config/codex/secrets/adb-device-keeper/config"
 RUNTIME_CHECK="$ROOT/scripts/runtime-check.sh"
 
-[[ -d "$ROOT/.git" ]] || { echo "Deploy requires a Git checkout: $ROOT" >&2; exit 1; }
+git -C "$ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1 || {
+    echo "Deploy requires a Git checkout: $ROOT" >&2
+    exit 1
+}
 [[ -z $(git -C "$ROOT" status --porcelain) ]] || { echo "Refusing deploy from dirty checkout" >&2; exit 1; }
 bash -n "$BIN_SRC"
 bash -n "$RUNTIME_CHECK"
