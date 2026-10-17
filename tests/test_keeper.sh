@@ -62,4 +62,19 @@ transport_is_candidate 0 '100.70.1.10:37123'
 transport_is_candidate 1 '100.70.1.20:41234'
 ! transport_is_candidate 0 '100.70.1.20:41234'
 
+DISCOVERED_ENDPOINT=('192.168.1.5:41234' '')
+write_state 0 endpoint '100.70.1.10:5555'
+[[ $(select_endpoint 0) == '100.70.1.10:5555' ]]
+[[ $(select_commit_endpoint '100.70.1.10:5555' '192.168.1.5:41234') == '100.70.1.10:5555' ]]
+[[ $(select_commit_endpoint 'EXAMPLE_A_SERIAL' '192.168.1.5:41234') == '192.168.1.5:41234' ]]
+write_state 0 endpoint '100.70.1.99:5555'
+[[ $(select_endpoint 0) == '192.168.1.5:41234' ]]
+DISCOVERED_ENDPOINT=("" "")
+! select_endpoint 0 >/dev/null
+DISCOVERED_ENDPOINT=('192.168.1.5:41234' '')
+write_state 0 endpoint '192.168.1.6:30000'
+[[ $(select_endpoint 0) == '192.168.1.5:41234' ]]
+DISCOVERED_ENDPOINT=("" "")
+[[ $(select_endpoint 0) == '192.168.1.6:30000' ]]
+
 echo 'TESTS=PASS'

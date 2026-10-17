@@ -2,7 +2,9 @@
 
 User systemd service that keeps allowlisted Android devices reachable through ADB wireless debugging on Fedora.
 
-The keeper tries the configured LAN/mDNS endpoint first. If the LAN path is not reachable and Tailscale already exposes the Android peer, it retries the same ADB wireless debugging port through the **matching device's** Tailscale IP and verifies Android identity before marking the device connected.
+The keeper uses LAN/mDNS discovery for Android Wi-Fi debugging. Once a Tailscale ADB TCP endpoint is verified, it prefers that saved endpoint over stale Wi-Fi mDNS and falls back to LAN discovery if TCP reconnect fails. If the LAN path is not reachable and Tailscale already exposes the Android peer, it retries the discovered ADB port through the **matching device's** Tailscale IP and verifies Android identity before marking the device connected.
+
+Without root, using ADB across mobile data first requires an authorized USB session and `adb tcpip 5555`; Tailscale itself does not start the Android ADB listener. Android normally resets this TCP mode after reboot. TCP port 5555 is not restricted to Tailscale, so avoid connecting to untrusted Wi-Fi while it is enabled.
 
 ## Runtime paths
 
