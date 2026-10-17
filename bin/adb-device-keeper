@@ -10,6 +10,7 @@ readonly LOCK_FILE="$STATE_DIR/keeper.lock"
 readonly ABSENT_INTERVAL=25
 readonly HEALTHY_INTERVAL=60
 readonly MAX_RETRY_DELAY=300
+readonly USB_RECOVERY_TIMEOUT=120
 
 declare -a DEVICE_NAME MANUFACTURER MODEL PRODUCT_DEVICE HARDWARE_SERIAL MDNS_PREFIX
 declare -a DISCOVERED_ENDPOINT CONNECTED_TRANSPORT
@@ -198,6 +199,28 @@ verify_transport() {
        $model == "${MODEL[$index]}" &&
        $product_device == "${PRODUCT_DEVICE[$index]}" &&
        $hardware_serial == "${HARDWARE_SERIAL[$index]}" ]]
+}
+
+is_usb_transport() {
+    local transport=$1
+    [[ -n $transport && $transport != *:* && $transport != emulator-* &&
+       $transport != adb-*._adb-tls-connect._tcp ]]
+}
+
+find_unique_usb_transport() {
+    local index=$1 devices_output transport state rest
+    local -a matches=()
+
+    devices_output=$(adb_with_timeout 8 devices 2>/dev/null) || return 1
+    while read -r transport state rest; do
+        [[ ${state:-} == device ]] || continue
+        is_usb_transport "$transport" || continue
+        verify_transport "$index" "$transport" || continue
+        matches+=("$transport")
+    done <<< "$devices_output"
+
+    ((${#matches[@]} == 1)) || return 1
+    printf '%s\n' "${matches[0]}"
 }
 
 disconnect_candidate() {
@@ -492,6 +515,47 @@ run_locked_cycle() {
     return "$rc"
 }
 
+recover_via_usb() {
+    local requested=$1 index=-1 candidate endpoint deadline output lock_fd
+
+    for ((candidate = 0; candidate < DEVICE_COUNT; candidate++)); do
+        if [[ ${DEVICE_NAME[$candidate]} == "$requested" ]]; then
+            index=$candidate
+            break
+        fi
+    done
+    ((index >= 0)) || die "dispositivo non allowlistato: $requested"
+
+    exec {lock_fd}> "$LOCK_FILE"
+    flock -w 12 "$lock_fd" || die "keeper occupato oltre il timeout di lock"
+
+    adb_with_timeout 12 start-server >/dev/null 2>&1 || die "server ADB non avviabile"
+    candidate=$(find_unique_usb_transport "$index") || \
+        die "collega via USB un solo ${DEVICE_NAME[$index]} autorizzato e accetta il debug sul telefono"
+    endpoint=$(tailscale_endpoint_for "$index" "127.0.0.1:5555") || \
+        die "peer Tailscale non disponibile per ${DEVICE_NAME[$index]}; completa il primo sblocco e attiva Tailscale"
+
+    output=$(adb_with_timeout 15 -s "$candidate" tcpip 5555 2>&1) || \
+        die "impossibile attivare ADB TCP/IP via USB: $output"
+
+    deadline=$((SECONDS + USB_RECOVERY_TIMEOUT))
+    while ((SECONDS < deadline)); do
+        adb_with_timeout 8 connect "$endpoint" >/dev/null 2>&1 || true
+        if verify_transport "$index" "$endpoint"; then
+            commit_endpoint "$index" "$endpoint"
+            commit_status "$index" 1 "$endpoint"
+            clear_retry "$index"
+            printf 'RECOVERY=PASS device=%s transport=%s\n' "${DEVICE_NAME[$index]}" "$endpoint"
+            flock -u "$lock_fd"
+            exec {lock_fd}>&-
+            return 0
+        fi
+        sleep 5
+    done
+
+    die "ADB TCP/IP avviato via USB ma ${DEVICE_NAME[$index]} non è raggiungibile su Tailscale entro ${USB_RECOVERY_TIMEOUT}s"
+}
+
 request_stop() {
     STOP_REQUESTED=1
 }
@@ -532,7 +596,11 @@ main() {
     case ${1:---once} in
         --daemon) run_daemon ;;
         --once) run_locked_cycle ;;
-        *) die "uso: adb-device-keeper [--daemon|--once]" ;;
+        --recover-usb)
+            (($# == 2)) || die "uso: adb-device-keeper --recover-usb DEVICE_NAME"
+            recover_via_usb "$2"
+            ;;
+        *) die "uso: adb-device-keeper [--daemon|--once|--recover-usb DEVICE_NAME]" ;;
     esac
 }
 

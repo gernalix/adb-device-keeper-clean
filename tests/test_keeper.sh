@@ -62,6 +62,10 @@ transport_is_candidate 0 '100.70.1.10:37123'
 ! transport_is_candidate 1 '100.70.1.10:37123'
 transport_is_candidate 1 '100.70.1.20:41234'
 ! transport_is_candidate 0 '100.70.1.20:41234'
+is_usb_transport 'EXAMPLE_A_SERIAL'
+! is_usb_transport '100.70.1.10:5555'
+! is_usb_transport 'emulator-5554'
+! is_usb_transport 'adb-EXAMPLE_A_SERIAL-abc._adb-tls-connect._tcp'
 
 DISCOVERED_ENDPOINT=('192.168.1.5:41234' '')
 write_state 0 endpoint '100.70.1.10:5555'
@@ -86,5 +90,37 @@ write_state 0 endpoint '192.168.1.6:30000'
 [[ $(select_endpoint 0) == '192.168.1.5:41234' ]]
 DISCOVERED_ENDPOINT=("" "")
 [[ $(select_endpoint 0) == '192.168.1.6:30000' ]]
+
+mkdir -p "$tmp/recovery-state"
+cat > "$tmp/recovery-config" <<'EOF'
+Example_A|ExampleVendor|Example Model A|example_a|EXAMPLE_A_SERIAL|adb-EXAMPLE_A_SERIAL-
+Example_B|ExampleVendor|Example Model B|example_b|EXAMPLE_B_SERIAL|adb-EXAMPLE_B_SERIAL-
+EOF
+cat > "$tmp/adb" <<'EOF'
+#!/usr/bin/env bash
+args="$*"
+case "$args" in
+  'start-server') exit 0 ;;
+  'devices') printf 'List of devices attached\nUSB_TRANSPORT device\n' ;;
+  '-s USB_TRANSPORT shell getprop ro.product.manufacturer') printf 'ExampleVendor\n' ;;
+  '-s USB_TRANSPORT shell getprop ro.product.model') printf 'Example Model A\n' ;;
+  '-s USB_TRANSPORT shell getprop ro.product.device') printf 'example_a\n' ;;
+  '-s USB_TRANSPORT shell getprop ro.serialno') printf 'EXAMPLE_A_SERIAL\n' ;;
+  '-s USB_TRANSPORT tcpip 5555') printf 'restarting in TCP mode port: 5555\n' ;;
+  'connect 100.70.1.10:5555') printf 'connected to 100.70.1.10:5555\n' ;;
+  '-s 100.70.1.10:5555 shell getprop ro.product.manufacturer') printf 'ExampleVendor\n' ;;
+  '-s 100.70.1.10:5555 shell getprop ro.product.model') printf 'Example Model A\n' ;;
+  '-s 100.70.1.10:5555 shell getprop ro.product.device') printf 'example_a\n' ;;
+  '-s 100.70.1.10:5555 shell getprop ro.serialno') printf 'EXAMPLE_A_SERIAL\n' ;;
+  *) exit 1 ;;
+esac
+EOF
+chmod +x "$tmp/adb"
+recovery_output=$(ADB_DEVICE_KEEPER_ADB="$tmp/adb" \
+  ADB_DEVICE_KEEPER_TAILSCALE="$tmp/tailscale" \
+  ADB_DEVICE_KEEPER_CONFIG="$tmp/recovery-config" \
+  ADB_DEVICE_KEEPER_STATE_DIR="$tmp/recovery-state" \
+  "$KEEPER" --recover-usb Example_A)
+grep -Fq 'RECOVERY=PASS device=Example_A transport=100.70.1.10:5555' <<< "$recovery_output"
 
 echo 'TESTS=PASS'

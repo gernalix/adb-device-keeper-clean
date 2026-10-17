@@ -6,6 +6,28 @@ The keeper uses LAN/mDNS discovery for Android Wi-Fi debugging. Once a Tailscale
 
 Without root, using ADB across mobile data first requires an authorized USB session and `adb tcpip 5555`; Tailscale itself does not start the Android ADB listener. Android normally resets this TCP mode after reboot. TCP port 5555 is not restricted to Tailscale, so avoid connecting to untrusted Wi-Fi while it is enabled.
 
+## Assisted recovery after reboot
+
+Stock Android does not let an ordinary app or Termux restore `adb tcpip 5555`
+after a cold reboot. The keeper therefore provides a bounded USB recovery path
+instead of claiming autonomous recovery:
+
+1. Let Android finish booting, perform the first unlock, and make sure Tailscale
+   is connected.
+2. Connect the allowlisted phone by USB and accept its existing ADB host key if
+   Android asks.
+3. Run `adb-device-keeper --recover-usb DEVICE_NAME`, using the name from the
+   private keeper config.
+4. Disconnect USB only after `RECOVERY=PASS` reports the verified Tailscale
+   endpoint.
+
+The command accepts only one physical USB transport whose complete configured
+identity matches the requested device. It starts TCP port 5555 through that USB
+session, then reports success only after reconnecting through the matching
+Tailscale peer and re-verifying the device identity. It does not install an
+Android app, persist an unlock secret, change VPN settings, or make the listener
+survive another reboot.
+
 ## Runtime paths
 
 - Script: `$HOME/.local/bin/adb-device-keeper`
